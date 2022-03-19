@@ -1,0 +1,231 @@
+---
+title: "CCA Final Project"
+author: "Konrat Pekkip"
+output: github_document
+---
+
+```{r setup, include = FALSE}
+#load required packages
+library(tidyverse)
+library(tidytext)
+library(knitr)
+library(rmarkdown)
+library(stopwords)
+library(tibble)
+library(unine) # contains german-language nlp tools 
+library(data.table) # necessary to import sentiment dictionary
+opts_chunk$set(echo=TRUE, include = TRUE, warning=FALSE, message=FALSE)
+```
+
+```{r load-data}
+gdr_speeches <- read_csv("/home/kpekkip/CFSS/hw09/big_ddr_subset.csv")
+gdr_speeches <- gdr_speeches %>%
+  mutate(party = 
+           ifelse(factionId == -1, "Not Found", 
+           ifelse(factionId == 0, "AfD",
+           ifelse(factionId == 3, "Grüne", 
+           ifelse(factionId == 4, "CDU/CSU", 
+           ifelse(factionId == 6 | factionId == 22, "PDS/Die Linke",
+           ifelse(factionId == 13, "FDP", 
+           ifelse(factionId == 16, "No Faction", "SPD")))))))) %>%
+  mutate(term = 
+           ifelse(electoralTerm == 11, "1987-1990", 
+           ifelse(electoralTerm == 12, "1990-1994",
+           ifelse(electoralTerm == 13, "1994-1998", 
+           ifelse(electoralTerm == 14, "1998-2002",
+           ifelse(electoralTerm == 15, "2002-2005", 
+           ifelse(electoralTerm == 16, "2005-2009",
+           ifelse(electoralTerm == 17, "2009-2013",
+           ifelse(electoralTerm == 18, "2013-2017", "2017-2021")))))))))
+```
+
+```{r load-sentiment-dictionary}
+get_sentiws <- function(){
+  
+  sentiws_tmp_dir <- file.path(tempdir(), "sentiws")
+  if (!file.exists(sentiws_tmp_dir)) dir.create(sentiws_tmp_dir)
+  sentiws_zipfile <- file.path(sentiws_tmp_dir, "SentiWS_v2.0c.zip")
+  sentiws_url <- "http://pcai056.informatik.uni-leipzig.de/downloads/etc/SentiWS/SentiWS_v2.0.zip"
+  download.file(url = sentiws_url, destfile = sentiws_zipfile)
+  unzip(zipfile = sentiws_zipfile, exdir = sentiws_tmp_dir)
+  
+  .unfold <- function(.SD){
+    pos <- gsub("^([A-Z]+)\\s+.*$", "\\1", .SD[["data"]][1])
+    weight <- as.numeric(gsub("^[A-Z]+\\s+(-?\\d\\.\\d+).*$", "\\1", .SD[["data"]][1]))
+    words <- gsub("^[A-Z]+\\s+-?\\d\\.\\d+\\s*(.*?)\\s*$", "\\1", .SD[["data"]][1])
+    words <- if (!grepl("^\\s*$", words)) strsplit(x = words, split = ",")[[1]] else NULL
+    list(
+      word = c(.SD[["word"]][1], words),
+      base = c(TRUE, rep(FALSE, times = length(words))),
+      lemma = .SD[["word"]][1],
+      pos = pos,
+      weight = weight
+    )
+  }
+  
+  
+dts <- lapply(
+    c(positive = "SentiWS_v2.0_Positive.txt", negative = "SentiWS_v2.0_Negative.txt"),
+    function(filename){
+      dt <- fread(file.path(sentiws_tmp_dir, filename), sep = "|")
+      colnames(dt) <- c("word", "data")
+      dt[, "id" :=  1L:nrow(dt)]
+      dt[, .unfold(.SD), by = c("id")]
+    }
+  )
+  rbindlist(dts)
+}
+
+all_sentiments <- get_sentiws()
+```
+
+```{r tokenization}
+gdr_tokens <- gdr_speeches %>%
+  unnest_tokens(
+    output = "tokens",
+    token = "words",
+    input = text,)
+```
+
+```{r removing-stopwords}
+#define a list of german stopwords i want to remove
+german_stopwords <- data.frame(word = stopwords("de"), stringsAsFactors = FALSE)
+gdr_tokens$word = gdr_tokens$tokens
+
+#remove stopwords from tokenized data frame
+tidy_speeches_nsw <- gdr_tokens %>%
+  anti_join(german_stopwords, by = c("word"))
+
+#stem tokens
+tidy_speeches_nsw$stemmed_words <- german_stemmer(tidy_speeches_nsw$word)
+
+#clean data frame
+
+clean_df <- tidy_speeches_nsw %>%
+  select(-tokenized_text, -tokens)
+```
+
+```{r word-counts}
+#amend data frame to include wordcount
+speeches_wordcount <- clean_df %>%
+  count(stemmed_words) %>%
+  slice_max(order_by = n, n = 15) %>%
+  mutate(word_reordered = reorder(stemmed_words, n))
+
+#repeat but organize data by electoral terms
+speeches_wc_byterm <- clean_df %>%
+  count(term, stemmed_words) %>%
+  group_by(term) %>%
+  slice_max(order_by = n, n = 8) %>%
+  mutate(word_reordered = reorder_within(stemmed_words, n, term))
+```
+
+```{r plot-word-counts}
+#plot most common words in general
+speeches_wordcount %>%
+  ggplot(mapping = aes(x = word_reordered, y = n)) +
+  geom_col(fill = "navy", color = "cyan") +
+  scale_x_reordered() +
+  coord_flip() +
+  theme_minimal() +
+  labs(title = "Most Frequently Used Words in GDR-Mentioning Bundestag Speeches",
+       subtitle = "For the 11th through 19th Bundestag, 1990-2021",
+       x = "Tokens",
+       y = "Number of Mentions of the Token",
+       caption = "Source: Open Discourse Project")
+
+#plot most common words by electoral term
+speeches_wc_byterm %>%
+  ggplot(mapping = aes(x = word_reordered, y = n, fill = term)) +
+  geom_col(color = "black") +
+  scale_x_reordered() +
+  labs(title = "Most Frequently Used Words in GDR-Mentioning Bundestag Speeches",
+       subtitle = "By Electoral Term, for the 11th through 19th Bundestag",
+       x = "Token",
+       y = "Number of Mentions of the Token",
+       caption = "Source: Open Discourse Project") +
+  facet_wrap(facets = vars(term), scales = "free") +
+  coord_flip() +
+  theme(legend.position = "none")
+```
+
+```{r word-count-party}
+#Organize data by parties
+speeches_wc_byparty <- clean_df %>%
+  count(party, stemmed_words) %>%
+  group_by(party) %>%
+  slice_max(order_by = n, n = 8) %>%
+  mutate(word_reordered = reorder_within(stemmed_words, n, party))
+
+#plot most common words by party
+speeches_wc_byparty %>%
+  ggplot(mapping = aes(x = word_reordered, y = n, fill = party)) +
+  geom_col(color = "black") +
+  scale_x_reordered() +
+  facet_wrap(facets = vars(party), scales = "free") +
+  coord_flip() +
+  theme(legend.position = "none") +
+  labs(title = "Most Frequently Used Words in GDR-Mentioning Bundestag Speeches",
+       subtitle = "By Party, for the 11th through 19th Bundestag, 1990-2021",
+       x = "Token",
+       y = "Number of Mentions of the Token",
+       caption = "Source: Open Discourse Project")
+```
+
+```{r sentiment-analysis}
+#merge df with sentiment dictionary
+sentiment_df <- inner_join(clean_df, all_sentiments, by = "word")
+
+#calculate sentiment score sum by session within electoral term
+sentiment_df %>%
+  group_by(term, session) %>%
+  summarize(sum_weight = sum(weight)) %>%
+  ggplot(mapping = aes(x = session, y = sum_weight, fill = term)) +
+  geom_col() +
+  facet_wrap(facets = vars(term), scales = "free")+
+  labs(title = "Sum of Sentiment Score per Session within Electoral Term",
+       subtitle = "By Electoral Term, for the 11th through 19th Bundestag",
+       x = "Session Number",
+       y = "Sum of Sentiment Scores") +
+  theme(legend.position = "none")
+
+#calculate cumulative sentiment by electoral term
+sentiment_df %>%
+  group_by(term) %>%
+  mutate(cumweight = cumsum(weight)) %>%
+  ggplot(mapping = aes(x = session, y = cumweight, fill = term)) +
+  geom_step(color = "navy") +
+  facet_wrap(facets = vars(term), scales = "free") +
+  theme_minimal() +
+  labs(title = "Cumulative Sentiment Score throughout Sessions in Electoral Terms",
+       subtitle = "By Electoral Term, for the 11th through 19th Bundestag",
+       x = "Session Number",
+       y = "Cumulative Sentiment Score")
+
+#calculate cumulative sentiment by electoral term
+cumsent_df <- sentiment_df %>%
+  unite(col = term_session, electoralTerm, session, sep = "")
+
+#add variable indicating term and session
+cumsent_df$term_session = as.numeric(cumsent_df$term_session)
+
+#transform that variable to increase by increments of 1
+cumsent_df$ts_counter <- c(0,cumsum(as.numeric(with(cumsent_df, term_session[1:(length(term_session)-1)] != term_session[2:length(term_session)]))))
+```
+
+```{r}
+#plot cumulative sentiments over time, by party
+cumsent_df %>%
+  group_by(ts_counter, party) %>%
+  mutate(cumweight = cumsum(weight)) %>%
+  ggplot(mapping = aes(x = ts_counter, y = cumweight)) +
+  geom_step(color = "navy") +
+  geom_smooth(color = "salmon", method = "gam", formula = y ~ s(x, bs = "cs")) +
+  facet_wrap(facets = vars(party), scales = "free") +
+  theme_minimal() +
+  labs(title = "Cumulative Sentiment Score throughout Electoral Terms and Sessions by Party",
+       subtitle = "Including Data for the 11th through 19th Bundestag, 1990-2021",
+       x = "Session Number",
+       y = "Cumulative Sentiment Score")
+```
+
